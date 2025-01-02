@@ -16,7 +16,7 @@
 static const float PI = 3.14159265f;
 static const float CHECKPOINT_RADIUS = 30.0f;
 static const size_t POPULATION_SIZE = 20;
-static const int GENERATIONS = 3; // Number of pre-races for optimization
+static const int GENERATIONS = 100; // Number of pre-races for optimization
 static const float MUTATION_RATE = 0.05f; // Mutation rate for waypoint adjustments
 
 // -------------------- Utility Functions --------------------
@@ -175,15 +175,6 @@ int main() {
         return -1;
     }
 
-    // Load shader
-    sf::Shader blueShader;
-    if (!blueShader.loadFromFile("blue_shader.frag", sf::Shader::Fragment)) {
-        std::cerr << "Error loading shader!\n";
-        return -1;
-    }
-    blueShader.setUniform("texture", sf::Shader::CurrentTexture);
-    blueShader.setUniform("color", sf::Glsl::Vec4(0.0f, 0.0f, 1.0f, 1.0f)); // Blue color
-
     // Create window
     sf::RenderWindow window(sf::VideoMode(1000, 800), "2D Racing - Two Player Mode");
     window.setFramerateLimit(60);
@@ -302,6 +293,71 @@ int main() {
     aiCar.setPosition(trainingWaypoints[0]);
     aiCurrentWaypoint = 0;
 
+    // After training phase and before the game loop
+    std::cout << "\nPress Enter to start countdown...";
+    std::cin.get();
+
+    // Countdown phase
+    window.setVisible(true);
+    bool countdownComplete = false;
+    sf::Clock countdownClock;
+    int countdownNumber = 3;
+
+    while (!countdownComplete && window.isOpen()) {
+        sf::Event event;
+        while (window.pollEvent(event)) {
+            if (event.type == sf::Event::Closed)
+                window.close();
+        }
+
+        // Draw regular scene first
+        window.clear(sf::Color(0, 100, 0));
+        for (auto& seg : trackSegments) window.draw(seg);
+        for (auto& border : trackBorders) window.draw(border);
+        for (auto& cp : checkpointShapes) window.draw(cp);
+        window.draw(playerCar);
+        window.draw(aiCar);
+
+        // Draw countdown
+        float elapsed = countdownClock.getElapsedTime().asSeconds();
+        if (elapsed >= 4.0f) {
+            countdownComplete = true;
+        } else {
+            // Create countdown circle
+            sf::CircleShape countCircle(50);
+            countCircle.setOrigin(50, 50);
+            countCircle.setPosition(window.getSize().x / 2, window.getSize().y / 2);
+            countCircle.setFillColor(sf::Color::White);
+            
+            if (elapsed < 3.0f) {
+                // Draw number of small circles based on countdown
+                int count = 3 - static_cast<int>(elapsed);
+                for (int i = 0; i < count; i++) {
+                    sf::CircleShape dot(10);
+                    dot.setOrigin(10, 10);
+                    dot.setPosition(
+                        window.getSize().x / 2 + (i - (count-1)/2.0f) * 30,
+                        window.getSize().y / 2
+                    );
+                    dot.setFillColor(sf::Color::Red);
+                    window.draw(dot);
+                }
+            } else {
+                // Draw "GO" rectangle
+                sf::RectangleShape goRect(sf::Vector2f(100, 40));
+                goRect.setOrigin(50, 20);
+                goRect.setPosition(window.getSize().x / 2, window.getSize().y / 2);
+                goRect.setFillColor(sf::Color::Green);
+                window.draw(goRect);
+            }
+        }
+
+        window.display();
+    }
+
+    // Reset clock for actual game timing
+    sf::Clock gameClock;
+
     // -------------------- Main Game Loop --------------------
     bool raceOver = false;
     std::string winner;
@@ -362,21 +418,23 @@ int main() {
                 sf::Vector2f direction = target - aiCar.getPosition();
                 float distanceToTarget = distance(aiCar.getPosition(), target);
 
-                if (distanceToTarget < 10.0f) { // If close to the waypoint, move to the next
+                if (distanceToTarget < 10.0f) {
                     aiCurrentWaypoint++;
                     if (aiCurrentWaypoint >= aiWaypoints.size()) {
                         aiCurrentWaypoint = 0; // Loop back to the first waypoint
                     }
                 } else {
-                    direction /= distanceToTarget; // Normalize direction
+                    direction /= distanceToTarget;
                     aiCar.move(direction * aiSpeed);
-
-                    if (!isWithinBorders(aiCar, aiSpeed, trackBorders)) {
-                        // Collision handled in isWithinBorders
-                    }
-
-                    float targetAngle = std::atan2(direction.y, direction.x) * 180.f / PI;
+                    float targetAngle = radToDeg(std::atan2(direction.y, direction.x));
                     aiCar.setRotation(targetAngle);
+                    
+                    // Modified speed limits here
+                    if (!isWithinBorders(aiCar, aiSpeed, trackBorders)) {
+                        aiSpeed = std::max(1.0f, aiSpeed - 0.5f);
+                    } else {
+                        aiSpeed = std::min(4.0f, aiSpeed + 0.1f);  // Changed from 5.0f to 4.5f
+                    }
                 }
             }
 
@@ -425,8 +483,8 @@ int main() {
         // Player car
         window.draw(playerCar);
 
-        // AI car with blue filter
-        window.draw(aiCar, &blueShader);
+        // AI car
+        window.draw(aiCar);
 
         // Display race results if finished
         if (raceOver && font.getInfo().family != "") {
