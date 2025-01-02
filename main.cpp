@@ -1,5 +1,5 @@
 /******************************************************
- *  2D Racing with Particle Swarm Optimization + SFML
+ *  2D Racing with Two-Player Mode + SFML
  ******************************************************/
 
 #include <SFML/Graphics.hpp>
@@ -7,37 +7,16 @@
 #include <vector>
 #include <iostream>
 #include <string>
-#include <fstream>
 #include <algorithm>
-#include <random>
-#include <tuple>
-#include <limits>
 #include <chrono>
 
 // -------------------- Constants --------------------
-static const float PI                     = 3.14159265f;
-static const int   NUM_ANGLE_STATES      = 36;   // 10-degree bins (0–350)
-static const int   NUM_SPEED_STATES      = 6;    // Speeds 0–5
-static const int   NUM_ACTIONS           = 5;    // STEER_LEFT, STEER_RIGHT, ACCELERATE, BRAKE, NOOP
-static const int   SWARM_SIZE            = 200;  // Swarm size for PSO
-static const float INERTIA_WEIGHT        = 0.7f; // Inertia weight (w)
-static const float COGNITIVE_COEFF       = 1.5f; // Cognitive coefficient (c1)
-static const float SOCIAL_COEFF          = 1.5f; // Social coefficient (c2)
-static const float MAX_VELOCITY          = 0.5f; // Maximum velocity per dimension
-static const int   MAX_STEPS             = 2000; // Maximum steps per episode
-static const int   MAX_GENERATIONS       = 7000; // Maximum number of generations
-const float MIN_SPEED_THRESHOLD = 0.1f;  // Minimum speed threshold
-const int MAX_STEPS_PER_EPISODE = 1000;  // Limit steps per episode
-const int MAX_ZERO_SPEED_STEPS = 50;      // Maximum steps allowed at zero speed
-const float POSITION_MIN = -5.f;          // Minimum policy weight
-const float POSITION_MAX = 5.f;           // Maximum policy weight
-
-// -------------------- Actions --------------------
-enum Action { STEER_LEFT, STEER_RIGHT, ACCELERATE, BRAKE, NOOP };
+static const float PI = 3.14159265f;
+static const float CHECKPOINT_RADIUS = 30.0f;
 
 // -------------------- Utility Functions --------------------
-float degToRad(float deg) { 
-    return deg * PI / 180.0f; 
+float degToRad(float deg) {
+    return deg * PI / 180.0f;
 }
 
 float distance(const sf::Vector2f& a, const sf::Vector2f& b) {
@@ -46,540 +25,91 @@ float distance(const sf::Vector2f& a, const sf::Vector2f& b) {
     return std::sqrt(dx * dx + dy * dy);
 }
 
-int angleToDiscrete(float angle) {
-    while (angle < 0.f)   angle += 360.f;
-    while (angle >= 360.f) angle -= 360.f;
-    return static_cast<int>(angle / 10.f) % NUM_ANGLE_STATES;
+bool isWithinBorders(sf::Sprite& car, float& speed, const std::vector<sf::RectangleShape>& borders) {
+    for (const auto& border : borders) {
+        if (car.getGlobalBounds().intersects(border.getGlobalBounds())) {
+            // Stop the car
+            speed = 0.0f;
+
+            // Move car slightly back in the opposite direction
+            float currentAngle = car.getRotation();
+            sf::Vector2f direction(-std::cos(degToRad(currentAngle)), -std::sin(degToRad(currentAngle)));
+            car.move(direction * 5.f);
+
+            return false;
+        }
+    }
+    return true;
 }
 
-int speedToDiscrete(float speed) {
-    int speedState = static_cast<int>(std::floor(speed));
-    // clamp to [0, NUM_SPEED_STATES - 1]
-    return std::clamp(speedState, 0, NUM_SPEED_STATES - 1);
+bool hasHitCheckpoint(const sf::Vector2f& carPosition, const sf::Vector2f& checkpointPosition) {
+    return distance(carPosition, checkpointPosition) < CHECKPOINT_RADIUS;
 }
-
-// -------------------- Car Class --------------------
-class Car {
-public:
-    Car(const std::vector<sf::Vector2f>& wps, const std::vector<sf::Vector2f>& cps, std::mt19937& rng)
-        : trainingTrackPoints(wps), checkpointPositions(cps) {
-        reset();
-        initializeRandomPolicy(rng);
-    }
-
-    // Copy constructor
-    Car(const Car& other)
-        : trainingTrackPoints(other.trainingTrackPoints),
-          checkpointPositions(other.checkpointPositions),
-          policyWeights(other.policyWeights) {
-        // We'll call reset() so that each new clone starts fresh
-        reset();
-    }
-
-    void reset() {
-        position           = trainingTrackPoints[0];
-        orientation        = 0.f;   // facing "east"
-        speed              = 0.f;
-        done               = false;
-        steps              = 0;
-        currentCheckpoint  = 0;    // Start with the first checkpoint
-        path.clear();             // Clear previous path
-        path.emplace_back(position); // Add starting position
-    }
-
-    // Initialize policy weights randomly in [-1, +1]
-    void initializeRandomPolicy(std::mt19937& rng) {
-        std::uniform_real_distribution<float> dist(-1.f, 1.f);
-        policyWeights.resize(NUM_ANGLE_STATES * NUM_SPEED_STATES * NUM_ACTIONS);
-        for (auto& w : policyWeights) {
-            w = dist(rng);
-        }
-    }
-
-    // Choose action based on current state + policy
-    Action chooseAction() const {
-        int angleState = angleToDiscrete(orientation);
-        int speedState = speedToDiscrete(speed);
-
-        // Compute scores for each action
-        float scores[NUM_ACTIONS] = {0.f};
-        for (int a = 0; a < NUM_ACTIONS; a++) {
-            int index = angleState * NUM_SPEED_STATES * NUM_ACTIONS 
-                      + speedState * NUM_ACTIONS 
-                      + a;
-            scores[a] = policyWeights[index];
-        }
-
-        // Select action with highest score
-        int   bestAction = 0;
-        float maxScore   = scores[0];
-        for (int a = 1; a < NUM_ACTIONS; a++) {
-            if (scores[a] > maxScore) {
-                maxScore   = scores[a];
-                bestAction = a;
-            }
-        }
-        return static_cast<Action>(bestAction);
-    }
-
-    // Apply action to update the Car's state
-    void applyAction(Action act) {
-        const float TURN_SPEED = 5.f;   // degrees per action
-        const float ACCEL = 0.2f;       // acceleration per action
-        const float DECEL = 0.2f;       // deceleration per action
-        const float MAX_SPEED = 5.f;    // maximum speed
-
-        switch (act) {
-            case STEER_LEFT:
-                orientation -= TURN_SPEED;
-                // Allow slight acceleration while turning
-                speed += ACCEL * 0.5f;
-                break;
-            case STEER_RIGHT:
-                orientation += TURN_SPEED;
-                // Allow slight acceleration while turning
-                speed += ACCEL * 0.5f;
-                break;
-            case ACCELERATE:
-                speed += ACCEL;
-                break;
-            case BRAKE:
-                speed -= DECEL;
-                break;
-            case NOOP:
-                // Small speed decay for NOOP to discourage inaction
-                speed *= 0.99f;
-                break;
-        }
-
-        // Clamp orientation
-        while (orientation < 0.f) orientation += 360.f;
-        while (orientation >= 360.f) orientation -= 360.f;
-
-        // Clamp speed
-        speed = std::clamp(speed, 0.f, MAX_SPEED);
-
-        // Move car
-        float rad = degToRad(orientation);
-        float vx = std::cos(rad) * speed;
-        float vy = std::sin(rad) * speed;
-        position += sf::Vector2f(vx, vy);
-
-        // Record path
-        path.emplace_back(position);
-
-        steps++;
-    }
-
-    // Evaluate performance of this car's policy on the training track
-    // Returns {totalReward, successStatus}
-    std::pair<float, bool> evaluate() {
-        float totalReward = 0.f;
-        reset();
-        int zeroSpeedSteps = 0;
-        float lastDistToCheckpoint = distance(position, checkpointPositions[currentCheckpoint]);
-
-        while (!done && steps < MAX_STEPS_PER_EPISODE) {
-            steps++;
-
-            // Current target checkpoint
-            if (currentCheckpoint >= static_cast<int>(checkpointPositions.size())) {
-                // All checkpoints hit
-                done = true;
-                break;
-            }
-
-            const sf::Vector2f& targetPoint = checkpointPositions[currentCheckpoint];
-            float distToTarget = distance(position, targetPoint);
-
-            // Calculate angle to target
-            float angleDiff = getAngleToTarget(targetPoint);
-
-            // Base reward structure
-            float reward = 0.f;
-
-            // Distance-based reward
-            if (distToTarget < lastDistToCheckpoint) {
-                reward += 1.0f; // Encourages moving closer to the target
-            } else {
-                reward -= 0.5f; // Penalty for moving away
-            }
-
-            // Speed reward when generally aligned with target
-            if (std::abs(angleDiff) < 45.f) {
-                reward += speed * 0.2f;
-            }
-
-            // Checkpoint completion reward
-            if (distToTarget < 30.f) { // Threshold for hitting a checkpoint
-                reward += 100.f; // Significant reward for hitting a checkpoint
-                currentCheckpoint++;
-
-                if (currentCheckpoint >= static_cast<int>(checkpointPositions.size())) {
-                    reward += 1000.f; // Additional reward for completing all checkpoints
-                    done = true;
-                    break;
-                }
-
-                // Update for next checkpoint
-                lastDistToCheckpoint = distance(position, checkpointPositions[currentCheckpoint]);
-            }
-
-            // Severe penalty for very slow movement
-            if (speed < MIN_SPEED_THRESHOLD) {
-                zeroSpeedSteps++;
-                reward -= 1.0f;
-                if (zeroSpeedSteps > MAX_ZERO_SPEED_STEPS) {
-                    done = true;
-                    break;
-                }
-            } else {
-                zeroSpeedSteps = 0;
-            }
-
-            // Apply chosen action
-            Action act = chooseAction();
-            applyAction(act);
-
-            lastDistToCheckpoint = distToTarget;
-            totalReward += reward;
-        }
-
-        // Scale final reward based on progress through checkpoints
-        float progressMultiplier = static_cast<float>(currentCheckpoint) / checkpointPositions.size();
-        totalReward *= (0.5f + progressMultiplier); // Base 0.5 + progress ratio
-
-        bool success = (currentCheckpoint >= static_cast<int>(checkpointPositions.size()));
-        return {totalReward, success};
-    }
-
-    // Accessors
-    sf::Vector2f getPosition()   const { return position; }
-    float        getOrientation() const { return orientation; }
-    bool         isSuccess()     const { 
-        return currentCheckpoint >= static_cast<int>(checkpointPositions.size()); 
-    }
-
-    // Policy weights (public for PSO manipulation)
-    std::vector<float> policyWeights;
-
-    // Path taken during evaluation
-    std::vector<sf::Vector2f> path;
-
-    // Current checkpoint index
-    int currentCheckpoint;
-
-    void setPosition(const sf::Vector2f& pos) {
-        position = pos;
-    }
-
-    void setOrientation(float orient) {
-        orientation = orient;
-        while (orientation < 0.f) orientation += 360.f;
-        while (orientation >= 360.f) orientation -= 360.f;
-    }
-
-    void reduceSpeed() {
-        speed *= 0.5f; // Reduce speed by half on collision
-    }
-
-private:
-    float getAngleToTarget(const sf::Vector2f& target) const {
-        sf::Vector2f dirToTarget = target - position;
-        float targetAngle = std::atan2(dirToTarget.y, dirToTarget.x) * 180.0f / PI;
-        float angleDiff = targetAngle - orientation;
-        while (angleDiff > 180.f) angleDiff -= 360.f;
-        while (angleDiff < -180.f) angleDiff += 360.f;
-        return angleDiff;
-    }
-
-    // Calculate optimal racing line point
-    sf::Vector2f calculateRacingLinePoint() const {
-        const sf::Vector2f& currentCP = checkpointPositions[currentCheckpoint];
-        sf::Vector2f nextCP;
-
-        // Look ahead to next checkpoint
-        if (currentCheckpoint + 1 < static_cast<int>(checkpointPositions.size())) {
-            nextCP = checkpointPositions[currentCheckpoint + 1];
-        } else {
-            nextCP = checkpointPositions[0]; // Loop back to start if needed
-        }
-
-        // Calculate middle point between checkpoints
-        sf::Vector2f midPoint = (currentCP + nextCP) * 0.5f;
-
-        // Adjust racing line towards inside of corners
-        float cornerAngle = std::abs(getAngleToTarget(nextCP) - getAngleToTarget(currentCP));
-        if (cornerAngle > 45.f) {
-            // Approaching a corner, adjust line towards inside
-            float cornerBias = 0.3f; // How much to cut the corner
-            return currentCP + (midPoint - currentCP) * cornerBias;
-        }
-
-        return currentCP; // Default to checkpoint if not cornering
-    }
-
-    // Member variables
-    sf::Vector2f              position;
-    float                     orientation; // in degrees
-    float                     speed;
-    bool                      done;
-    int                       steps;
-    std::vector<sf::Vector2f> trainingTrackPoints;
-    std::vector<sf::Vector2f> checkpointPositions;
-
-    // Car movement constants
-    static const float TURN_SPEED;
-    static const float ACCEL;
-    static const float DECEL;
-    static const float MAX_SPEED;
-};
-
-// Initialize Car static constants
-const float Car::TURN_SPEED = 5.f;   // degrees per action
-const float Car::ACCEL      = 0.2f;  // acceleration per action
-const float Car::DECEL      = 0.2f;  // deceleration per action
-const float Car::MAX_SPEED  = 5.f;   // max speed ~ 5 px/frame
-
-// -------------------- Particle Class --------------------
-struct Particle {
-    std::vector<float> position;           // Current policyWeights
-    std::vector<float> velocity;           // Velocity in policyWeights space
-    std::vector<float> personalBestPosition; // Best position ever achieved by this particle
-    float personalBestFitness;             // Fitness at the personal best position
-
-    Particle(int numWeights, std::mt19937& rng) {
-        std::uniform_real_distribution<float> posDist(POSITION_MIN, POSITION_MAX);
-        std::uniform_real_distribution<float> velDist(-0.1f, 0.1f); // Initial velocity range
-
-        position.resize(numWeights);
-        velocity.resize(numWeights);
-        personalBestPosition.resize(numWeights);
-        personalBestFitness = -std::numeric_limits<float>::max();
-
-        for(int i = 0; i < numWeights; ++i) {
-            position[i] = posDist(rng);
-            velocity[i] = velDist(rng);
-            personalBestPosition[i] = position[i];
-        }
-    }
-
-    void updatePersonalBest(float fitness) {
-        if(fitness > personalBestFitness) {
-            personalBestFitness = fitness;
-            personalBestPosition = position;
-        }
-    }
-};
-
-// -------------------- Best Performance Struct --------------------
-struct BestPerformance {
-    float reward;
-    int generation;
-    int checkpoints;
-    std::vector<float> weights;
-    std::vector<sf::Vector2f> bestPath;
-    BestPerformance() : reward(-std::numeric_limits<float>::max()), generation(0), checkpoints(0) {}
-};
 
 // -------------------- Main Function --------------------
 int main() {
     // Create a simple rectangular track with rounded corners
     std::vector<sf::Vector2f> trainingWaypoints = {
-        // Start/Finish on the left side
-        {200, 400},  // Start
-        {400, 400},  // Right side of bottom straight
-        {600, 400},
-        {800, 400},  // Approaching first turn
-
-        // First turn (right)
-        {900, 400},
-        {900, 300},  // Going up
-        {900, 200},
-
-        // Top straight
-        {800, 200},
-        {600, 200},
-        {400, 200},
-        {200, 200},
-
-        // Final turn (right)
-        {200, 300},  // Going down
-        {200, 400}   // Back to start
+        {200, 400}, {400, 400}, {600, 400}, {800, 400},
+        {900, 400}, {900, 300}, {900, 200}, {800, 200},
+        {600, 200}, {400, 200}, {200, 200}, {200, 300}, {200, 400}
     };
 
     // Define checkpoints for evaluation and visualization
     std::vector<sf::Vector2f> checkpointPositions = {
-        {500, 400},  // Bottom straight
-        {900, 300},  // First turn
-        {500, 200},  // Top straight
-        {200, 300}   // Final turn
+        {500, 400}, {900, 300}, {500, 200}, {200, 300}
     };
 
-    // RNG
-    std::random_device rd;
-    std::mt19937 rng(rd());
-
-    // Initialize swarm
-    std::cout << "Initializing swarm with " << SWARM_SIZE << " particles..." << std::endl;
-    int numWeights = NUM_ANGLE_STATES * NUM_SPEED_STATES * NUM_ACTIONS;
-    std::vector<Particle> swarm;
-    swarm.reserve(SWARM_SIZE);
-    for(int i = 0; i < SWARM_SIZE; i++) {
-        swarm.emplace_back(numWeights, rng);
-    }
-
-    // Initialize global best
-    std::vector<float> globalBestPosition(numWeights);
-    float globalBestFitness = -std::numeric_limits<float>::max();
-
-    // We will store the best car seen so far
-    BestPerformance bestEver;
-    int successfulEpisodes = 0;
-
-    // Training loop
-    std::cout << "\nStarting training with PSO...\n" << std::endl;
-    int generation = 0;
-    auto startTime = std::chrono::high_resolution_clock::now();
-    int lastProgress = 0;
-    bool raceCompleted = false;
-
-    while (generation < MAX_GENERATIONS && !raceCompleted) {
-        generation++;
-
-        // Calculate progress percentage
-        int progress = (generation * 100) / MAX_GENERATIONS;
-        if (progress != lastProgress) {
-            auto currentTime = std::chrono::high_resolution_clock::now();
-            auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
-                currentTime - startTime).count();
-
-            // Clear line and show progress
-            std::cout << "\rProgress: " << progress << "% | "
-                      << "Generation: " << generation << " | "
-                      << "Time: " << elapsedSeconds << "s | "
-                      << "Best Checkpoints: " << bestEver.checkpoints << "/" 
-                      << checkpointPositions.size()
-                      << std::flush;
-
-            lastProgress = progress;
-        }
-
-        // Evaluate each particle
-        for(auto& particle : swarm) {
-            // Create a Car instance with particle's position as policyWeights
-            Car car(trainingWaypoints, checkpointPositions, rng);
-            car.policyWeights = particle.position;
-
-            // Evaluate car's performance
-            auto [reward, success] = car.evaluate();
-
-            // Update personal best
-            particle.updatePersonalBest(reward);
-
-            // Update global best
-            if(reward > globalBestFitness) {
-                globalBestFitness = reward;
-                globalBestPosition = particle.position;
-
-                bestEver.reward = reward;
-                bestEver.generation = generation;
-                bestEver.checkpoints = car.currentCheckpoint;
-                bestEver.weights = particle.position;
-                bestEver.bestPath = car.path;
-
-                if(success) {
-                    raceCompleted = true;
-                }
-            }
-        }
-
-        // PSO velocity and position update
-        for(auto& particle : swarm) {
-            for(int i = 0; i < numWeights; ++i) {
-                // Random coefficients
-                std::uniform_real_distribution<float> dist(0.f, 1.f);
-                float r1 = dist(rng);
-                float r2 = dist(rng);
-
-                // Update velocity
-                particle.velocity[i] = INERTIA_WEIGHT * particle.velocity[i]
-                                       + COGNITIVE_COEFF * r1 * (particle.personalBestPosition[i] - particle.position[i])
-                                       + SOCIAL_COEFF * r2 * (globalBestPosition[i] - particle.position[i]);
-
-                // Clamp velocity
-                if(particle.velocity[i] > MAX_VELOCITY)
-                    particle.velocity[i] = MAX_VELOCITY;
-                if(particle.velocity[i] < -MAX_VELOCITY)
-                    particle.velocity[i] = -MAX_VELOCITY;
-
-                // Update position
-                particle.position[i] += particle.velocity[i];
-
-                // Clamp position
-                if(particle.position[i] > POSITION_MAX)
-                    particle.position[i] = POSITION_MAX;
-                if(particle.position[i] < POSITION_MIN)
-                    particle.position[i] = POSITION_MIN;
-            }
-        }
-    }
-
-    // Final report
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto totalSeconds = std::chrono::duration_cast<std::chrono::seconds>(
-        endTime - startTime).count();
-
-    std::cout << "\n\n=== Training Complete ===" << std::endl;
-    std::cout << "Total Time: " << totalSeconds << " seconds" << std::endl;
-    std::cout << "Generations Run: " << generation << std::endl;
-    std::cout << "\nBest Performance:" << std::endl;
-    std::cout << "  Generation: " << bestEver.generation << std::endl;
-    std::cout << "  Reward: " << bestEver.reward << std::endl;
-    std::cout << "  Checkpoints Hit: " << bestEver.checkpoints << "/" 
-              << checkpointPositions.size() << std::endl;
-
-    if (raceCompleted) {
-        std::cout << "\nSUCCESS: All checkpoints hit!" << std::endl;
-    } else {
-        std::cout << "\nFailed to hit all checkpoints. Best progress: " 
-                  << bestEver.checkpoints << " checkpoints" << std::endl;
-    }
-
-    // --------------- Visualization Phase ---------------
     // Load textures
     sf::Texture player1Texture, player2Texture;
     if (!player1Texture.loadFromFile("player1.png") ||
         !player2Texture.loadFromFile("player2.png")) {
-        std::cout << "Error loading car textures!\nMake sure player1.png & player2.png exist.\n";
+        std::cerr << "Error loading car textures! Make sure player1.png & player2.png exist.\n";
         return -1;
     }
 
+    // Load shader
+    sf::Shader blueShader;
+    if (!blueShader.loadFromFile("blue_shader.frag", sf::Shader::Fragment)) {
+        std::cerr << "Error loading shader!\n";
+        return -1;
+    }
+    blueShader.setUniform("texture", sf::Shader::CurrentTexture);
+    blueShader.setUniform("color", sf::Glsl::Vec4(0.0f, 0.0f, 1.0f, 1.0f)); // Blue color
+
     // Create window
-    sf::RenderWindow window(sf::VideoMode(1000, 800), "2D Racing with PSO");
+    sf::RenderWindow window(sf::VideoMode(1000, 800), "2D Racing - Two Player Mode");
     window.setFramerateLimit(60);
 
-    // Optional player car sprite (not driven by AI)
+    // Player car sprite
     sf::Sprite playerCar(player1Texture);
-    playerCar.setScale(
-        40.0f / player1Texture.getSize().x,
-        20.0f / player1Texture.getSize().y
-    );
-    playerCar.setOrigin(
-        player1Texture.getSize().x / 2.0f, 
-        player1Texture.getSize().y / 2.0f
-    );
+    playerCar.setScale(40.0f / player1Texture.getSize().x, 20.0f / player1Texture.getSize().y);
+    playerCar.setOrigin(player1Texture.getSize().x / 2.0f, player1Texture.getSize().y / 2.0f);
+    playerCar.setPosition(trainingWaypoints[0]);
 
-    // AI car sprite
-    sf::Sprite aiCar(player2Texture);
-    aiCar.setScale(
-        40.0f / player2Texture.getSize().x,
-        20.0f / player2Texture.getSize().y
-    );
-    aiCar.setOrigin(
-        player2Texture.getSize().x / 2.0f, 
-        player2Texture.getSize().y / 2.0f
-    );
+    // AI car sprite 1 (with blue filter)
+    sf::Sprite aiCar1(player2Texture);
+    aiCar1.setScale(40.0f / player2Texture.getSize().x, 20.0f / player2Texture.getSize().y);
+    aiCar1.setOrigin(player2Texture.getSize().x / 2.0f, player2Texture.getSize().y / 2.0f);
+    aiCar1.setPosition(trainingWaypoints[0]);
+
+    // AI car sprite 2 (without blue filter)
+    sf::Sprite aiCar2(player2Texture);
+    aiCar2.setScale(40.0f / player2Texture.getSize().x, 20.0f / player2Texture.getSize().y);
+    aiCar2.setOrigin(player2Texture.getSize().x / 2.0f, player2Texture.getSize().y / 2.0f);
+    aiCar2.setPosition(trainingWaypoints[0]);
+
+    // AI car variables
+    size_t ai1CurrentCheckpoint = 0;
+    size_t ai2CurrentCheckpoint = 0;
+    float ai1Speed = 3.0f;
+    float ai2Speed = 3.0f;
+
+    // Checkpoint tracking
+    size_t playerCurrentCheckpoint = 0;
+    size_t playerCheckpointsHit = 0;
+    size_t ai1CheckpointsHit = 0;
+    size_t ai2CheckpointsHit = 0;
 
     // Prepare track rendering
     const float TRACK_WIDTH = 80.f;
@@ -612,34 +142,26 @@ int main() {
     auto addBorderSegment = [&](const sf::Vector2f& start, const sf::Vector2f& end) {
         sf::Vector2f diff = end - start;
         float length = std::sqrt(diff.x * diff.x + diff.y * diff.y);
-        
+
         sf::RectangleShape border(sf::Vector2f(length, 5.f));
         border.setPosition(start);
         border.setFillColor(sf::Color::Red);
-        
+
         // Calculate rotation
         float rotation = std::atan2(diff.y, diff.x) * 180.f / PI;
         border.setRotation(rotation);
-        
+
         trackBorders.push_back(border);
     };
 
     // Outer border coordinates (clockwise)
     std::vector<sf::Vector2f> outerBorder = {
-        {150, 450},  // Bottom left
-        {950, 450},  // Bottom right
-        {950, 150},  // Top right
-        {150, 150},  // Top left
-        {150, 450}   // Back to start
+        {150, 450}, {950, 450}, {950, 150}, {150, 150}, {150, 450}
     };
 
     // Inner border coordinates (clockwise)
     std::vector<sf::Vector2f> innerBorder = {
-        {250, 350},  // Bottom left
-        {850, 350},  // Bottom right
-        {850, 250},  // Top right
-        {250, 250},  // Top left
-        {250, 350}   // Back to start
+        {250, 350}, {850, 350}, {850, 250}, {250, 250}, {250, 350}
     };
 
     // Create border segments
@@ -656,37 +178,19 @@ int main() {
         cp.setPosition(checkpointPositions[i]);
         cp.setFillColor(sf::Color::Yellow);
         // Quick orientation hack
-        if (i == 0 || i == 2) 
+        if (i == 0 || i == 2)
             cp.setRotation(90.f);
         checkpointShapes.push_back(cp);
     }
 
-    // Set up the "bestCar" for visualization
-    Car bestCar(trainingWaypoints, checkpointPositions, rng);
-    bestCar.policyWeights = globalBestPosition;
-    bestCar.reset();
-    // Apply the policy weights to the bestCar
-    // Normally, the bestCar would be evaluated again to set its path correctly
-    bestCar.evaluate();
+    // Player controls
+    float playerSpeed = 0.0f;
+    float playerRotation = 0.0f;
 
-    // Load font for displaying results
-    sf::Font font;
-    if (!font.loadFromFile("arial.ttf")) {
-        std::cerr << "Failed to load font!\nMake sure arial.ttf exists." << std::endl;
-        return -1;
-    }
-
+    // Main rendering loop
     bool raceOver = false;
-    bool aiWon    = false;
+    std::string winner;
 
-    // Create a VertexArray to store the best path
-    sf::VertexArray bestPathLine(sf::LineStrip, bestEver.bestPath.size());
-    for (size_t i = 0; i < bestEver.bestPath.size(); ++i) {
-        bestPathLine[i].position = bestEver.bestPath[i];
-        bestPathLine[i].color = sf::Color::Blue;
-    }
-
-    // --------------- Main Rendering Loop ---------------
     while (window.isOpen()) {
         sf::Event event;
         while (window.pollEvent(event)) {
@@ -695,125 +199,165 @@ int main() {
             }
         }
 
-        // Player 1 Controls
-        float playerSpeed = 0.0f;
-        float playerRotation = 0.0f;
-        
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Up))
-            playerSpeed = 5.0f;
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Down))
-            playerSpeed = -3.0f;
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Left))
-            playerRotation = -3.0f;
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Right))
-            playerRotation = 3.0f;
-
-        // Update player position
-        sf::Vector2f oldPlayerPos = playerCar.getPosition();
-        float oldPlayerRot = playerCar.getRotation();
-        
-        playerCar.rotate(playerRotation);
-        float angle = playerCar.getRotation() * PI / 180.f;
-        playerCar.move(std::cos(angle) * playerSpeed, std::sin(angle) * playerSpeed);
-
-        // Check player collision with borders
-        bool playerCollision = false;
-        for (const auto& border : trackBorders) {
-            if (playerCar.getGlobalBounds().intersects(border.getGlobalBounds())) {
-                playerCollision = true;
-                break;
-            }
-        }
-        
-        if (playerCollision) {
-            // Bounce effect: reverse position and add a small opposite impulse
-            playerCar.setPosition(oldPlayerPos);
-            playerCar.setRotation(oldPlayerRot);
-            // Optional: Add a small bounce-back effect
-            float bounceAngle = oldPlayerRot * PI / 180.f;
-            playerCar.move(-std::cos(bounceAngle) * 2.0f, -std::sin(bounceAngle) * 2.0f);
-        }
-
-        // AI Car Update
         if (!raceOver) {
-            // Reset and evaluate the bestCar to get its updated path
-            bestCar.reset();
-            auto [reward, success] = bestCar.evaluate();
+            // Player 1 Controls (WASD)
+            playerSpeed = 0.0f;
+            playerRotation = 0.0f;
 
-            // Update AI car sprite
-            aiCar.setPosition(bestCar.getPosition());
-            aiCar.setRotation(bestCar.getOrientation());
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::W))
+                playerSpeed = 5.0f;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::S))
+                playerSpeed = -3.0f;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::A))
+                playerRotation = -3.0f;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::D))
+                playerRotation = 3.0f;
 
-            // Update the best path line
-            bestPathLine.clear();
-            for (const auto& pos : bestCar.path) {
-                bestPathLine.append(sf::Vertex(pos, sf::Color::Blue));
+            // Update player car position
+            sf::Vector2f oldPlayerPos = playerCar.getPosition();
+            playerCar.rotate(playerRotation);
+            float angle = degToRad(playerCar.getRotation());
+            playerCar.move(std::cos(angle) * playerSpeed, std::sin(angle) * playerSpeed);
+
+            // Check for collision and adjust position if necessary
+            if (!isWithinBorders(playerCar, playerSpeed, trackBorders)) {
+                // No need to reset position, as bounce is handled in isWithinBorders
             }
 
-            // Check if AI has hit all checkpoints
-            if (success) {
+            // Check if player hits checkpoint
+            if (hasHitCheckpoint(playerCar.getPosition(), checkpointPositions[playerCurrentCheckpoint])) {
+                playerCurrentCheckpoint++;
+                playerCheckpointsHit++;
+                if (playerCurrentCheckpoint >= checkpointPositions.size()) {
+                    playerCurrentCheckpoint = 0; // Loop back to first checkpoint
+                }
+            }
+
+            // AI car 1 logic: move towards the next checkpoint
+            if (ai1CurrentCheckpoint < checkpointPositions.size()) {
+                sf::Vector2f target = checkpointPositions[ai1CurrentCheckpoint];
+                sf::Vector2f direction = target - aiCar1.getPosition();
+                float distanceToTarget = distance(aiCar1.getPosition(), target);
+
+                if (hasHitCheckpoint(aiCar1.getPosition(), target)) {
+                    ai1CurrentCheckpoint++;
+                    ai1CheckpointsHit++;
+                    if (ai1CurrentCheckpoint >= checkpointPositions.size()) {
+                        ai1CurrentCheckpoint = 0; // Loop back to the first checkpoint
+                    }
+                } else {
+                    direction /= distanceToTarget;
+                    aiCar1.move(direction * ai1Speed);
+
+                    if (!isWithinBorders(aiCar1, ai1Speed, trackBorders)) {
+                        // No need to reset position, as bounce is handled in isWithinBorders
+                    }
+
+                    float targetAngle = std::atan2(direction.y, direction.x) * 180.f / PI;
+                    aiCar1.setRotation(targetAngle);
+                }
+            }
+
+            // AI car 2 logic: move towards the next checkpoint
+            if (ai2CurrentCheckpoint < checkpointPositions.size()) {
+                sf::Vector2f target = checkpointPositions[ai2CurrentCheckpoint];
+                sf::Vector2f direction = target - aiCar2.getPosition();
+                float distanceToTarget = distance(aiCar2.getPosition(), target);
+
+                if (hasHitCheckpoint(aiCar2.getPosition(), target)) {
+                    ai2CurrentCheckpoint++;
+                    ai2CheckpointsHit++;
+                    if (ai2CurrentCheckpoint >= checkpointPositions.size()) {
+                        ai2CurrentCheckpoint = 0; // Loop back to the first checkpoint
+                    }
+                } else {
+                    direction /= distanceToTarget;
+                    aiCar2.move(direction * ai2Speed);
+
+                    if (!isWithinBorders(aiCar2, ai2Speed, trackBorders)) {
+                        // No need to reset position, as bounce is handled in isWithinBorders
+                    }
+
+                    float targetAngle = std::atan2(direction.y, direction.x) * 180.f / PI;
+                    aiCar2.setRotation(targetAngle);
+                }
+            }
+
+            // Check if the race is over
+            if (playerCheckpointsHit >= 4) {
                 raceOver = true;
-                aiWon = true;
+                winner = "Player 1";
+            } else if (ai1CheckpointsHit >= 4) {
+                raceOver = true;
+                winner = "AI 1";
+            } else if (ai2CheckpointsHit >= 4) {
+                raceOver = true;
+                winner = "AI 2";
             }
         }
 
-        // ---- Draw ----
-        window.clear(sf::Color(0, 100, 0)); // green background
+        // Draw everything
+        window.clear(sf::Color(0, 100, 0)); // Green background
 
-        // 1. Track
+        // Track
         for (auto& seg : trackSegments) {
             window.draw(seg);
         }
 
-        // 2. Checkpoints
-        for (size_t i = 0; i < checkpointShapes.size(); i++) {
-            if (i < (size_t)bestCar.currentCheckpoint) {
-                checkpointShapes[i].setFillColor(sf::Color::Green);
-            } else if (i == (size_t)bestCar.currentCheckpoint) {
-                checkpointShapes[i].setFillColor(sf::Color::Yellow);
-            } else {
-                checkpointShapes[i].setFillColor(sf::Color(128,128,128));
-            }
-            window.draw(checkpointShapes[i]);
-        }
-
-        // 3. Best Path
-        if (!bestCar.path.empty()) {
-            window.draw(bestPathLine);
-        }
-
-        // 4. AI car
-        window.draw(aiCar);
-
-        // 5. Player car
-        window.draw(playerCar);
-
-        // 6. Borders
+        // Borders
         for (auto& border : trackBorders) {
             window.draw(border);
         }
 
-        // 7. Race result overlay if finished
-        if (raceOver) {
-            sf::RectangleShape resultBox(sf::Vector2f(300.f, 100.f));
-            resultBox.setPosition(
-                window.getSize().x / 2.f - 150.f, 
-                window.getSize().y / 2.f - 50.f
-            );
-            resultBox.setFillColor(aiWon ? sf::Color::Green : sf::Color::Red);
-            window.draw(resultBox);
+        // Checkpoints
+        for (size_t i = 0; i < checkpointShapes.size(); i++) {
+            window.draw(checkpointShapes[i]);
+        }
 
-            // Show text
+        // Player car
+        window.draw(playerCar);
+
+        // AI car 1 with blue filter
+        window.draw(aiCar1, &blueShader);
+
+        // AI car 2 without blue filter
+        window.draw(aiCar2);
+
+        // Display race results if finished
+        if (raceOver) {
+            sf::Font font;
+            if (!font.loadFromFile("arial.ttf")) {
+                std::cerr << "Failed to load font!\n";
+                return -1;
+            }
+
             sf::Text resultText;
             resultText.setFont(font);
-            resultText.setString(aiWon ? "AI Completed All Checkpoints!" : "AI Failed to Complete All Checkpoints.");
-            resultText.setCharacterSize(24);
+            resultText.setString(winner + " Wins!");
+            resultText.setCharacterSize(48);
             resultText.setFillColor(sf::Color::White);
-            resultText.setPosition(
-                resultBox.getPosition().x + 20.f, 
-                resultBox.getPosition().y + 30.f
-            );
+            resultText.setPosition(400.f, 350.f);
             window.draw(resultText);
+        }
+
+        // Display checkpoint status
+        sf::Font font;
+        if (font.loadFromFile("arial.ttf")) {
+            sf::Text checkpointStatus;
+            checkpointStatus.setFont(font);
+            checkpointStatus.setCharacterSize(24);
+            checkpointStatus.setFillColor(sf::Color::White);
+            checkpointStatus.setPosition(10.f, 10.f);
+
+            std::string status = "Player 1: " + std::to_string(playerCheckpointsHit) + "/4\n";
+            status += "AI 1: " + std::to_string(ai1CheckpointsHit) + "/4\n";
+            status += "AI 2: " + std::to_string(ai2CheckpointsHit) + "/4\n";
+            status += "Player 1 Remaining: " + std::to_string(4 - playerCheckpointsHit) + "\n";
+            status += "AI 1 Remaining: " + std::to_string(4 - ai1CheckpointsHit) + "\n";
+            status += "AI 2 Remaining: " + std::to_string(4 - ai2CheckpointsHit);
+
+            checkpointStatus.setString(status);
+            window.draw(checkpointStatus);
         }
 
         window.display();
