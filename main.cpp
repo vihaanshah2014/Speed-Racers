@@ -1,5 +1,5 @@
 /******************************************************
- *  2D Racing with Simple Genetic Algorithm + SFML
+ *  2D Racing with Particle Swarm Optimization + SFML
  ******************************************************/
 
 #include <SFML/Graphics.hpp>
@@ -15,18 +15,22 @@
 #include <chrono>
 
 // -------------------- Constants --------------------
-static const float PI                = 3.14159265f;
-static const int   NUM_ANGLE_STATES = 36;   // 10-degree bins (0–350)
-static const int   NUM_SPEED_STATES = 6;    // Speeds 0–5
-static const int   NUM_ACTIONS      = 5;    // STEER_LEFT, STEER_RIGHT, ACCELERATE, BRAKE, NOOP
-static const int   POPULATION_SIZE  = 100;  // Number of AI cars per generation
-static const int   TOP_PERFORMERS   = 20;   // Number of top cars to select
-static const float MUTATION_RATE    = 0.1f; // Mutation rate for policy weights
-static const int   MAX_STEPS        = 1000; // Max steps per evaluation
-static const int   MAX_GENERATIONS  = 10000; // Stop after these many generations if no success
-const int MAX_STEPS_PER_EPISODE = 1000;  // Limit steps per episode
+static const float PI                     = 3.14159265f;
+static const int   NUM_ANGLE_STATES      = 36;   // 10-degree bins (0–350)
+static const int   NUM_SPEED_STATES      = 6;    // Speeds 0–5
+static const int   NUM_ACTIONS           = 5;    // STEER_LEFT, STEER_RIGHT, ACCELERATE, BRAKE, NOOP
+static const int   SWARM_SIZE            = 200;  // Swarm size for PSO
+static const float INERTIA_WEIGHT        = 0.7f; // Inertia weight (w)
+static const float COGNITIVE_COEFF       = 1.5f; // Cognitive coefficient (c1)
+static const float SOCIAL_COEFF          = 1.5f; // Social coefficient (c2)
+static const float MAX_VELOCITY          = 0.5f; // Maximum velocity per dimension
+static const int   MAX_STEPS             = 2000; // Maximum steps per episode
+static const int   MAX_GENERATIONS       = 7000; // Maximum number of generations
 const float MIN_SPEED_THRESHOLD = 0.1f;  // Minimum speed threshold
-const int MAX_ZERO_SPEED_STEPS = 50;     // Maximum steps allowed at zero speed
+const int MAX_STEPS_PER_EPISODE = 1000;  // Limit steps per episode
+const int MAX_ZERO_SPEED_STEPS = 50;      // Maximum steps allowed at zero speed
+const float POSITION_MIN = -5.f;          // Minimum policy weight
+const float POSITION_MAX = 5.f;           // Maximum policy weight
 
 // -------------------- Actions --------------------
 enum Action { STEER_LEFT, STEER_RIGHT, ACCELERATE, BRAKE, NOOP };
@@ -57,15 +61,16 @@ int speedToDiscrete(float speed) {
 // -------------------- Car Class --------------------
 class Car {
 public:
-    Car(const std::vector<sf::Vector2f>& wps, std::mt19937& rng)
-        : trainingTrackPoints(wps) {
+    Car(const std::vector<sf::Vector2f>& wps, const std::vector<sf::Vector2f>& cps, std::mt19937& rng)
+        : trainingTrackPoints(wps), checkpointPositions(cps) {
         reset();
         initializeRandomPolicy(rng);
     }
 
-    // Copy constructor (important for cloning in GA)
+    // Copy constructor
     Car(const Car& other)
         : trainingTrackPoints(other.trainingTrackPoints),
+          checkpointPositions(other.checkpointPositions),
           policyWeights(other.policyWeights) {
         // We'll call reset() so that each new clone starts fresh
         reset();
@@ -77,7 +82,9 @@ public:
         speed              = 0.f;
         done               = false;
         steps              = 0;
-        targetWaypointIndex = 0;    // Start with the first waypoint
+        currentCheckpoint  = 0;    // Start with the first checkpoint
+        path.clear();             // Clear previous path
+        path.emplace_back(position); // Add starting position
     }
 
     // Initialize policy weights randomly in [-1, +1]
@@ -137,7 +144,7 @@ public:
                 speed += ACCEL;
                 break;
             case BRAKE:
-                speed += ACCEL;
+                speed -= DECEL;
                 break;
             case NOOP:
                 // Small speed decay for NOOP to discourage inaction
@@ -158,6 +165,9 @@ public:
         float vy = std::sin(rad) * speed;
         position += sf::Vector2f(vx, vy);
 
+        // Record path
+        path.emplace_back(position);
+
         steps++;
     }
 
@@ -165,105 +175,99 @@ public:
     // Returns {totalReward, successStatus}
     std::pair<float, bool> evaluate() {
         float totalReward = 0.f;
-        steps = 0;
+        reset();
         int zeroSpeedSteps = 0;
-        float lastAngleDiff = 360.f;  // Track previous angle difference
+        float lastDistToCheckpoint = distance(position, checkpointPositions[currentCheckpoint]);
 
         while (!done && steps < MAX_STEPS_PER_EPISODE) {
             steps++;
-            
-            if (steps % 1000 == 0) {
-                std::cout << "Step: " << steps 
-                          << " | Waypoint: " << targetWaypointIndex 
-                          << "/" << trainingTrackPoints.size()
-                          << " | Speed: " << speed << std::endl;
+
+            // Current target checkpoint
+            if (currentCheckpoint >= static_cast<int>(checkpointPositions.size())) {
+                // All checkpoints hit
+                done = true;
+                break;
             }
 
-            Action act = chooseAction();
-            applyAction(act);
+            const sf::Vector2f& targetPoint = checkpointPositions[currentCheckpoint];
+            float distToTarget = distance(position, targetPoint);
 
-            sf::Vector2f targetPos = trainingTrackPoints[targetWaypointIndex];
-            float distToTarget = distance(position, targetPos);
-            
-            sf::Vector2f dirToTarget = targetPos - position;
-            float targetAngle = std::atan2(dirToTarget.y, dirToTarget.x) * 180.0f / PI;
-            float angleDiff = std::abs(orientation - targetAngle);
-            while (angleDiff > 180.f) angleDiff = std::abs(angleDiff - 360.f);
+            // Calculate angle to target
+            float angleDiff = getAngleToTarget(targetPoint);
 
-            // Base penalty to encourage quick completion
-            float reward = -0.1f;
+            // Base reward structure
+            float reward = 0.f;
 
-            // Turning improvement reward
-            if (angleDiff < lastAngleDiff) {
-                reward += 0.5f;  // Reward for turning towards target
-            }
-            lastAngleDiff = angleDiff;
-
-            // Speed and direction rewards
-            if (angleDiff < 45.f) {
-                reward += (45.f - angleDiff) / 45.f * 2.0f;  // Double alignment reward
-                if (speed > 2.f) {
-                    reward += 1.0f;  // Bonus for speed while aligned
-                }
+            // Distance-based reward
+            if (distToTarget < lastDistToCheckpoint) {
+                reward += 1.0f; // Encourages moving closer to the target
             } else {
-                // Strong penalty for not turning towards target
-                reward -= angleDiff / 45.f;
+                reward -= 0.5f; // Penalty for moving away
             }
 
-            // Zero speed penalty
-            if (speed < 0.1f) {
+            // Speed reward when generally aligned with target
+            if (std::abs(angleDiff) < 45.f) {
+                reward += speed * 0.2f;
+            }
+
+            // Checkpoint completion reward
+            if (distToTarget < 30.f) { // Threshold for hitting a checkpoint
+                reward += 100.f; // Significant reward for hitting a checkpoint
+                currentCheckpoint++;
+
+                if (currentCheckpoint >= static_cast<int>(checkpointPositions.size())) {
+                    reward += 1000.f; // Additional reward for completing all checkpoints
+                    done = true;
+                    break;
+                }
+
+                // Update for next checkpoint
+                lastDistToCheckpoint = distance(position, checkpointPositions[currentCheckpoint]);
+            }
+
+            // Severe penalty for very slow movement
+            if (speed < MIN_SPEED_THRESHOLD) {
                 zeroSpeedSteps++;
                 reward -= 1.0f;
                 if (zeroSpeedSteps > MAX_ZERO_SPEED_STEPS) {
                     done = true;
-                    reward -= 100.f;
                     break;
                 }
             } else {
                 zeroSpeedSteps = 0;
             }
 
-            // Off-track penalty
-            if (distToTarget > 200.f) {
-                done = true;
-                reward -= 200.f;
-                break;
-            }
+            // Apply chosen action
+            Action act = chooseAction();
+            applyAction(act);
 
-            // Waypoint rewards
-            if (distToTarget < 20.f) {
-                reward += 100.f;  // Big reward for reaching waypoints
-                targetWaypointIndex++;
-                
-                if (targetWaypointIndex >= static_cast<int>(trainingTrackPoints.size())) {
-                    reward += 1000.f;  // Huge completion bonus
-                    done = true;
-                    break;
-                }
-            }
-
+            lastDistToCheckpoint = distToTarget;
             totalReward += reward;
         }
 
-        if (steps >= MAX_STEPS_PER_EPISODE) {
-            done = true;
-        }
+        // Scale final reward based on progress through checkpoints
+        float progressMultiplier = static_cast<float>(currentCheckpoint) / checkpointPositions.size();
+        totalReward *= (0.5f + progressMultiplier); // Base 0.5 + progress ratio
 
-        return {totalReward, (targetWaypointIndex >= static_cast<int>(trainingTrackPoints.size()))};
+        bool success = (currentCheckpoint >= static_cast<int>(checkpointPositions.size()));
+        return {totalReward, success};
     }
 
     // Accessors
     sf::Vector2f getPosition()   const { return position; }
     float        getOrientation() const { return orientation; }
     bool         isSuccess()     const { 
-        return targetWaypointIndex >= static_cast<int>(trainingTrackPoints.size()); 
+        return currentCheckpoint >= static_cast<int>(checkpointPositions.size()); 
     }
 
-    // Policy weights (public for GA manipulation)
+    // Policy weights (public for PSO manipulation)
     std::vector<float> policyWeights;
 
-    // We expose the current waypoint index for external checks
-    int targetWaypointIndex;
+    // Path taken during evaluation
+    std::vector<sf::Vector2f> path;
+
+    // Current checkpoint index
+    int currentCheckpoint;
 
     void setPosition(const sf::Vector2f& pos) {
         position = pos;
@@ -279,13 +283,50 @@ public:
         speed *= 0.5f; // Reduce speed by half on collision
     }
 
-public:
+private:
+    float getAngleToTarget(const sf::Vector2f& target) const {
+        sf::Vector2f dirToTarget = target - position;
+        float targetAngle = std::atan2(dirToTarget.y, dirToTarget.x) * 180.0f / PI;
+        float angleDiff = targetAngle - orientation;
+        while (angleDiff > 180.f) angleDiff -= 360.f;
+        while (angleDiff < -180.f) angleDiff += 360.f;
+        return angleDiff;
+    }
+
+    // Calculate optimal racing line point
+    sf::Vector2f calculateRacingLinePoint() const {
+        const sf::Vector2f& currentCP = checkpointPositions[currentCheckpoint];
+        sf::Vector2f nextCP;
+
+        // Look ahead to next checkpoint
+        if (currentCheckpoint + 1 < static_cast<int>(checkpointPositions.size())) {
+            nextCP = checkpointPositions[currentCheckpoint + 1];
+        } else {
+            nextCP = checkpointPositions[0]; // Loop back to start if needed
+        }
+
+        // Calculate middle point between checkpoints
+        sf::Vector2f midPoint = (currentCP + nextCP) * 0.5f;
+
+        // Adjust racing line towards inside of corners
+        float cornerAngle = std::abs(getAngleToTarget(nextCP) - getAngleToTarget(currentCP));
+        if (cornerAngle > 45.f) {
+            // Approaching a corner, adjust line towards inside
+            float cornerBias = 0.3f; // How much to cut the corner
+            return currentCP + (midPoint - currentCP) * cornerBias;
+        }
+
+        return currentCP; // Default to checkpoint if not cornering
+    }
+
+    // Member variables
     sf::Vector2f              position;
     float                     orientation; // in degrees
     float                     speed;
     bool                      done;
     int                       steps;
     std::vector<sf::Vector2f> trainingTrackPoints;
+    std::vector<sf::Vector2f> checkpointPositions;
 
     // Car movement constants
     static const float TURN_SPEED;
@@ -300,71 +341,45 @@ const float Car::ACCEL      = 0.2f;  // acceleration per action
 const float Car::DECEL      = 0.2f;  // deceleration per action
 const float Car::MAX_SPEED  = 5.f;   // max speed ~ 5 px/frame
 
-// -------------------- Genetic Algorithm Helpers --------------------
-std::vector<Car> selectTopPerformers(const std::vector<Car>& population,
-                                     const std::vector<std::pair<float, bool>>& performances,
-                                     int topN) 
-{
-    // Create index array [0..population.size()-1]
-    std::vector<size_t> indices(population.size());
-    for (size_t i = 0; i < population.size(); i++) 
-        indices[i] = i;
+// -------------------- Particle Class --------------------
+struct Particle {
+    std::vector<float> position;           // Current policyWeights
+    std::vector<float> velocity;           // Velocity in policyWeights space
+    std::vector<float> personalBestPosition; // Best position ever achieved by this particle
+    float personalBestFitness;             // Fitness at the personal best position
 
-    // Sort indices by descending reward
-    std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-        return performances[a].first > performances[b].first;
-    });
+    Particle(int numWeights, std::mt19937& rng) {
+        std::uniform_real_distribution<float> posDist(POSITION_MIN, POSITION_MAX);
+        std::uniform_real_distribution<float> velDist(-0.1f, 0.1f); // Initial velocity range
 
-    // Gather top N
-    std::vector<Car> topPerformers;
-    for (int i = 0; i < topN && i < static_cast<int>(indices.size()); i++) {
-        topPerformers.push_back(population[indices[i]]);
-    }
-    return topPerformers;
-}
+        position.resize(numWeights);
+        velocity.resize(numWeights);
+        personalBestPosition.resize(numWeights);
+        personalBestFitness = -std::numeric_limits<float>::max();
 
-// Create next generation by cloning and mutating top performers
-std::vector<Car> createNextGeneration(const std::vector<Car>& topPerformers,
-                                      int populationSize,
-                                      std::mt19937& rng) 
-{
-    std::vector<Car> nextGeneration;
-    nextGeneration.reserve(populationSize);
-
-    std::uniform_int_distribution<int> selectionDist(0, (int)topPerformers.size() - 1);
-    std::normal_distribution<float>    mutationDist(0.f, 0.1f);
-
-    while ((int)nextGeneration.size() < populationSize) {
-        // Pick a parent from the top
-        int parentIdx = selectionDist(rng);
-        const Car& parent = topPerformers[parentIdx];
-
-        // Clone
-        Car child(parent); // uses copy constructor
-
-        // Mutate
-        for (auto& weight : child.policyWeights) {
-            // random chance to mutate each weight
-            std::uniform_real_distribution<float> chanceDist(0.f, 1.f);
-            if (chanceDist(rng) < MUTATION_RATE) {
-                weight += mutationDist(rng);
-                // clamp weights for sanity
-                weight = std::clamp(weight, -5.f, 5.f);
-            }
+        for(int i = 0; i < numWeights; ++i) {
+            position[i] = posDist(rng);
+            velocity[i] = velDist(rng);
+            personalBestPosition[i] = position[i];
         }
-
-        nextGeneration.push_back(child);
     }
-    return nextGeneration;
-}
 
-// Add these global variables at the top with other constants
+    void updatePersonalBest(float fitness) {
+        if(fitness > personalBestFitness) {
+            personalBestFitness = fitness;
+            personalBestPosition = position;
+        }
+    }
+};
+
+// -------------------- Best Performance Struct --------------------
 struct BestPerformance {
     float reward;
     int generation;
-    int waypoints;
+    int checkpoints;
     std::vector<float> weights;
-    BestPerformance() : reward(-std::numeric_limits<float>::max()), generation(0), waypoints(0) {}
+    std::vector<sf::Vector2f> bestPath;
+    BestPerformance() : reward(-std::numeric_limits<float>::max()), generation(0), checkpoints(0) {}
 };
 
 // -------------------- Main Function --------------------
@@ -376,24 +391,24 @@ int main() {
         {400, 400},  // Right side of bottom straight
         {600, 400},
         {800, 400},  // Approaching first turn
-        
+
         // First turn (right)
         {900, 400},
         {900, 300},  // Going up
         {900, 200},
-        
+
         // Top straight
         {800, 200},
         {600, 200},
         {400, 200},
         {200, 200},
-        
+
         // Final turn (right)
         {200, 300},  // Going down
         {200, 400}   // Back to start
     };
 
-    // Optional: Add checkpoints for visualization
+    // Define checkpoints for evaluation and visualization
     std::vector<sf::Vector2f> checkpointPositions = {
         {500, 400},  // Bottom straight
         {900, 300},  // First turn
@@ -405,73 +420,109 @@ int main() {
     std::random_device rd;
     std::mt19937 rng(rd());
 
-    // Initialize population
-    std::cout << "Initializing population with " << POPULATION_SIZE << " cars..." << std::endl;
-    std::vector<Car> population;
-    population.reserve(POPULATION_SIZE);
-    for (int i = 0; i < POPULATION_SIZE; i++) {
-        population.emplace_back(trainingWaypoints, rng);
+    // Initialize swarm
+    std::cout << "Initializing swarm with " << SWARM_SIZE << " particles..." << std::endl;
+    int numWeights = NUM_ANGLE_STATES * NUM_SPEED_STATES * NUM_ACTIONS;
+    std::vector<Particle> swarm;
+    swarm.reserve(SWARM_SIZE);
+    for(int i = 0; i < SWARM_SIZE; i++) {
+        swarm.emplace_back(numWeights, rng);
     }
 
-    // We will store the best car seen so far
-    Car bestCar(trainingWaypoints, rng);
-    float bestCarReward = -999999.f;
-    bool raceCompleted  = false;
+    // Initialize global best
+    std::vector<float> globalBestPosition(numWeights);
+    float globalBestFitness = -std::numeric_limits<float>::max();
 
-    // Add these global variables at the top with other constants
+    // We will store the best car seen so far
     BestPerformance bestEver;
     int successfulEpisodes = 0;
 
     // Training loop
-    std::cout << "\nStarting training...\n" << std::endl;
+    std::cout << "\nStarting training with PSO...\n" << std::endl;
     int generation = 0;
     auto startTime = std::chrono::high_resolution_clock::now();
     int lastProgress = 0;
+    bool raceCompleted = false;
 
     while (generation < MAX_GENERATIONS && !raceCompleted) {
         generation++;
-        
+
         // Calculate progress percentage
         int progress = (generation * 100) / MAX_GENERATIONS;
         if (progress != lastProgress) {
             auto currentTime = std::chrono::high_resolution_clock::now();
             auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
                 currentTime - startTime).count();
-            
+
             // Clear line and show progress
             std::cout << "\rProgress: " << progress << "% | "
                       << "Generation: " << generation << " | "
                       << "Time: " << elapsedSeconds << "s | "
-                      << "Best Waypoints: " << bestEver.waypoints 
+                      << "Best Checkpoints: " << bestEver.checkpoints << "/" 
+                      << checkpointPositions.size()
                       << std::flush;
-            
+
             lastProgress = progress;
         }
 
-        std::vector<std::pair<float, bool>> performances;
-        performances.reserve(POPULATION_SIZE);
+        // Evaluate each particle
+        for(auto& particle : swarm) {
+            // Create a Car instance with particle's position as policyWeights
+            Car car(trainingWaypoints, checkpointPositions, rng);
+            car.policyWeights = particle.position;
 
-        // Evaluate each car (remove all logging from evaluate())
-        for (int i = 0; i < POPULATION_SIZE; i++) {
-            auto& car = population[i];
+            // Evaluate car's performance
             auto [reward, success] = car.evaluate();
-            performances.push_back({reward, success});
 
-            if (reward > bestEver.reward) {
+            // Update personal best
+            particle.updatePersonalBest(reward);
+
+            // Update global best
+            if(reward > globalBestFitness) {
+                globalBestFitness = reward;
+                globalBestPosition = particle.position;
+
                 bestEver.reward = reward;
                 bestEver.generation = generation;
-                bestEver.waypoints = car.targetWaypointIndex;
-                bestEver.weights = car.policyWeights;
-            }
+                bestEver.checkpoints = car.currentCheckpoint;
+                bestEver.weights = particle.position;
+                bestEver.bestPath = car.path;
 
-            if (success) {
-                raceCompleted = true;
+                if(success) {
+                    raceCompleted = true;
+                }
             }
         }
 
-        // Create next generation (silently)
-        std::vector<Car> topPerformers = selectTopPerformers(population, performances, TOP_PERFORMERS);
-        population = createNextGeneration(topPerformers, POPULATION_SIZE, rng);
+        // PSO velocity and position update
+        for(auto& particle : swarm) {
+            for(int i = 0; i < numWeights; ++i) {
+                // Random coefficients
+                std::uniform_real_distribution<float> dist(0.f, 1.f);
+                float r1 = dist(rng);
+                float r2 = dist(rng);
+
+                // Update velocity
+                particle.velocity[i] = INERTIA_WEIGHT * particle.velocity[i]
+                                       + COGNITIVE_COEFF * r1 * (particle.personalBestPosition[i] - particle.position[i])
+                                       + SOCIAL_COEFF * r2 * (globalBestPosition[i] - particle.position[i]);
+
+                // Clamp velocity
+                if(particle.velocity[i] > MAX_VELOCITY)
+                    particle.velocity[i] = MAX_VELOCITY;
+                if(particle.velocity[i] < -MAX_VELOCITY)
+                    particle.velocity[i] = -MAX_VELOCITY;
+
+                // Update position
+                particle.position[i] += particle.velocity[i];
+
+                // Clamp position
+                if(particle.position[i] > POSITION_MAX)
+                    particle.position[i] = POSITION_MAX;
+                if(particle.position[i] < POSITION_MIN)
+                    particle.position[i] = POSITION_MIN;
+            }
+        }
     }
 
     // Final report
@@ -485,14 +536,14 @@ int main() {
     std::cout << "\nBest Performance:" << std::endl;
     std::cout << "  Generation: " << bestEver.generation << std::endl;
     std::cout << "  Reward: " << bestEver.reward << std::endl;
-    std::cout << "  Waypoints: " << bestEver.waypoints << "/" 
-              << trainingWaypoints.size() << std::endl;
+    std::cout << "  Checkpoints Hit: " << bestEver.checkpoints << "/" 
+              << checkpointPositions.size() << std::endl;
 
     if (raceCompleted) {
-        std::cout << "\nSUCCESS: Track completed!" << std::endl;
+        std::cout << "\nSUCCESS: All checkpoints hit!" << std::endl;
     } else {
-        std::cout << "\nTrack not completed. Best progress: " 
-                  << bestEver.waypoints << " waypoints" << std::endl;
+        std::cout << "\nFailed to hit all checkpoints. Best progress: " 
+                  << bestEver.checkpoints << " checkpoints" << std::endl;
     }
 
     // --------------- Visualization Phase ---------------
@@ -505,7 +556,7 @@ int main() {
     }
 
     // Create window
-    sf::RenderWindow window(sf::VideoMode(1000, 800), "2D Racing with GA");
+    sf::RenderWindow window(sf::VideoMode(1000, 800), "2D Racing with PSO");
     window.setFramerateLimit(60);
 
     // Optional player car sprite (not driven by AI)
@@ -597,7 +648,7 @@ int main() {
         addBorderSegment(innerBorder[i], innerBorder[i + 1]);
     }
 
-    // Optional "checkpoints"
+    // Optional "checkpoints" for visualization
     std::vector<sf::RectangleShape> checkpointShapes;
     for (size_t i = 0; i < checkpointPositions.size(); i++) {
         sf::RectangleShape cp(sf::Vector2f(TRACK_WIDTH, 10.f));
@@ -611,11 +662,29 @@ int main() {
     }
 
     // Set up the "bestCar" for visualization
-    Car aiController = bestCar;
-    aiController.reset();
+    Car bestCar(trainingWaypoints, checkpointPositions, rng);
+    bestCar.policyWeights = globalBestPosition;
+    bestCar.reset();
+    // Apply the policy weights to the bestCar
+    // Normally, the bestCar would be evaluated again to set its path correctly
+    bestCar.evaluate();
+
+    // Load font for displaying results
+    sf::Font font;
+    if (!font.loadFromFile("arial.ttf")) {
+        std::cerr << "Failed to load font!\nMake sure arial.ttf exists." << std::endl;
+        return -1;
+    }
 
     bool raceOver = false;
     bool aiWon    = false;
+
+    // Create a VertexArray to store the best path
+    sf::VertexArray bestPathLine(sf::LineStrip, bestEver.bestPath.size());
+    for (size_t i = 0; i < bestEver.bestPath.size(); ++i) {
+        bestPathLine[i].position = bestEver.bestPath[i];
+        bestPathLine[i].color = sf::Color::Blue;
+    }
 
     // --------------- Main Rendering Loop ---------------
     while (window.isOpen()) {
@@ -667,48 +736,24 @@ int main() {
 
         // AI Car Update
         if (!raceOver) {
-            // Store old position for collision check
-            sf::Vector2f oldAIPos = aiCar.getPosition();
-            float oldAIRot = aiCar.getRotation();
-
-            Action act = aiController.chooseAction();
-            aiController.applyAction(act);
+            // Reset and evaluate the bestCar to get its updated path
+            bestCar.reset();
+            auto [reward, success] = bestCar.evaluate();
 
             // Update AI car sprite
-            aiCar.setPosition(aiController.getPosition());
-            aiCar.setRotation(aiController.getOrientation());
+            aiCar.setPosition(bestCar.getPosition());
+            aiCar.setRotation(bestCar.getOrientation());
 
-            // Check AI collision with borders
-            bool aiCollision = false;
-            for (const auto& border : trackBorders) {
-                if (aiCar.getGlobalBounds().intersects(border.getGlobalBounds())) {
-                    aiCollision = true;
-                    break;
-                }
+            // Update the best path line
+            bestPathLine.clear();
+            for (const auto& pos : bestCar.path) {
+                bestPathLine.append(sf::Vertex(pos, sf::Color::Blue));
             }
 
-            if (aiCollision) {
-                // Bounce effect for AI
-                aiController.setPosition(oldAIPos);
-                aiController.setOrientation(oldAIRot);
-                // Add a small bounce-back effect
-                float bounceAngle = oldAIRot * PI / 180.f;
-                sf::Vector2f bounceVec(-std::cos(bounceAngle) * 2.0f, -std::sin(bounceAngle) * 2.0f);
-                aiController.setPosition(oldAIPos + bounceVec);
-                
-                // Optional: Reduce AI speed on collision
-                aiController.reduceSpeed();
-            }
-
-            // Check if AI reached next waypoint
-            float distToTarget = distance(aiController.getPosition(), 
-                                       trainingWaypoints[aiController.targetWaypointIndex]);
-            if (distToTarget < 10.f) {
-                aiController.targetWaypointIndex++;
-                if (aiController.targetWaypointIndex >= static_cast<int>(trainingWaypoints.size())) {
-                    raceOver = true;
-                    aiWon = true;
-                }
+            // Check if AI has hit all checkpoints
+            if (success) {
+                raceOver = true;
+                aiWon = true;
             }
         }
 
@@ -722,9 +767,9 @@ int main() {
 
         // 2. Checkpoints
         for (size_t i = 0; i < checkpointShapes.size(); i++) {
-            if (i < (size_t)aiController.targetWaypointIndex) {
+            if (i < (size_t)bestCar.currentCheckpoint) {
                 checkpointShapes[i].setFillColor(sf::Color::Green);
-            } else if (i == (size_t)aiController.targetWaypointIndex) {
+            } else if (i == (size_t)bestCar.currentCheckpoint) {
                 checkpointShapes[i].setFillColor(sf::Color::Yellow);
             } else {
                 checkpointShapes[i].setFillColor(sf::Color(128,128,128));
@@ -732,37 +777,41 @@ int main() {
             window.draw(checkpointShapes[i]);
         }
 
-        // 3. AI car
+        // 3. Best Path
+        if (!bestCar.path.empty()) {
+            window.draw(bestPathLine);
+        }
+
+        // 4. AI car
         window.draw(aiCar);
 
-        // 4. Borders
+        // 5. Player car
+        window.draw(playerCar);
+
+        // 6. Borders
         for (auto& border : trackBorders) {
             window.draw(border);
         }
 
-        // 5. Race result overlay if finished
+        // 7. Race result overlay if finished
         if (raceOver) {
-            sf::RectangleShape resultBox(sf::Vector2f(200.f, 100.f));
+            sf::RectangleShape resultBox(sf::Vector2f(300.f, 100.f));
             resultBox.setPosition(
-                window.getSize().x / 2.f - 100.f, 
+                window.getSize().x / 2.f - 150.f, 
                 window.getSize().y / 2.f - 50.f
             );
             resultBox.setFillColor(aiWon ? sf::Color::Green : sf::Color::Red);
             window.draw(resultBox);
 
             // Show text
-            sf::Font font;
-            if (!font.loadFromFile("arial.ttf")) {
-                std::cerr << "Failed to load font!\n";
-            }
             sf::Text resultText;
             resultText.setFont(font);
-            resultText.setString(aiWon ? "AI Wins!" : "AI Failed!");
+            resultText.setString(aiWon ? "AI Completed All Checkpoints!" : "AI Failed to Complete All Checkpoints.");
             resultText.setCharacterSize(24);
             resultText.setFillColor(sf::Color::White);
             resultText.setPosition(
                 resultBox.getPosition().x + 20.f, 
-                resultBox.getPosition().y + 35.f
+                resultBox.getPosition().y + 30.f
             );
             window.draw(resultText);
         }
