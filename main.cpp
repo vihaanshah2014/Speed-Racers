@@ -87,29 +87,29 @@ int main() {
     playerCar.setOrigin(player1Texture.getSize().x / 2.0f, player1Texture.getSize().y / 2.0f);
     playerCar.setPosition(trainingWaypoints[0]);
 
-    // AI car sprite 1 (with blue filter)
-    sf::Sprite aiCar1(player2Texture);
-    aiCar1.setScale(40.0f / player2Texture.getSize().x, 20.0f / player2Texture.getSize().y);
-    aiCar1.setOrigin(player2Texture.getSize().x / 2.0f, player2Texture.getSize().y / 2.0f);
-    aiCar1.setPosition(trainingWaypoints[0]);
+    // AI car sprite
+    sf::Sprite aiCar(player2Texture);
+    aiCar.setScale(40.0f / player2Texture.getSize().x, 20.0f / player2Texture.getSize().y);
+    aiCar.setOrigin(player2Texture.getSize().x / 2.0f, player2Texture.getSize().y / 2.0f);
+    aiCar.setPosition(trainingWaypoints[0]);
 
-    // AI car sprite 2 (without blue filter)
-    sf::Sprite aiCar2(player2Texture);
-    aiCar2.setScale(40.0f / player2Texture.getSize().x, 20.0f / player2Texture.getSize().y);
-    aiCar2.setOrigin(player2Texture.getSize().x / 2.0f, player2Texture.getSize().y / 2.0f);
-    aiCar2.setPosition(trainingWaypoints[0]);
+    // Define AI waypoints (these should be more detailed than checkpoints)
+    std::vector<sf::Vector2f> aiWaypoints = {
+        {200, 400}, {300, 400}, {400, 400}, {500, 400}, {600, 400}, {700, 400}, {800, 400},
+        {900, 400}, {900, 350}, {900, 300}, {900, 250}, {900, 200}, {800, 200}, {700, 200},
+        {600, 200}, {500, 200}, {400, 200}, {300, 200}, {200, 200}, {200, 250}, {200, 300},
+        {200, 350}, {200, 400}
+    };
 
     // AI car variables
-    size_t ai1CurrentCheckpoint = 0;
-    size_t ai2CurrentCheckpoint = 0;
-    float ai1Speed = 3.0f;
-    float ai2Speed = 3.0f;
+    size_t aiCurrentWaypoint = 0;
+    float aiSpeed = 3.0f;
 
     // Checkpoint tracking
     size_t playerCurrentCheckpoint = 0;
     size_t playerCheckpointsHit = 0;
-    size_t ai1CheckpointsHit = 0;
-    size_t ai2CheckpointsHit = 0;
+    size_t aiCurrentCheckpoint = 0;
+    size_t aiCheckpointsHit = 0;
 
     // Prepare track rendering
     const float TRACK_WIDTH = 80.f;
@@ -233,53 +233,36 @@ int main() {
                 }
             }
 
-            // AI car 1 logic: move towards the next checkpoint
-            if (ai1CurrentCheckpoint < checkpointPositions.size()) {
-                sf::Vector2f target = checkpointPositions[ai1CurrentCheckpoint];
-                sf::Vector2f direction = target - aiCar1.getPosition();
-                float distanceToTarget = distance(aiCar1.getPosition(), target);
+            // AI car logic: move towards the next waypoint
+            if (aiCurrentWaypoint < aiWaypoints.size()) {
+                sf::Vector2f target = aiWaypoints[aiCurrentWaypoint];
+                sf::Vector2f direction = target - aiCar.getPosition();
+                float distanceToTarget = distance(aiCar.getPosition(), target);
 
-                if (hasHitCheckpoint(aiCar1.getPosition(), target)) {
-                    ai1CurrentCheckpoint++;
-                    ai1CheckpointsHit++;
-                    if (ai1CurrentCheckpoint >= checkpointPositions.size()) {
-                        ai1CurrentCheckpoint = 0; // Loop back to the first checkpoint
+                if (distanceToTarget < 10.0f) { // If close to the waypoint, move to the next
+                    aiCurrentWaypoint++;
+                    if (aiCurrentWaypoint >= aiWaypoints.size()) {
+                        aiCurrentWaypoint = 0; // Loop back to the first waypoint
                     }
                 } else {
                     direction /= distanceToTarget;
-                    aiCar1.move(direction * ai1Speed);
+                    aiCar.move(direction * aiSpeed);
 
-                    if (!isWithinBorders(aiCar1, ai1Speed, trackBorders)) {
+                    if (!isWithinBorders(aiCar, aiSpeed, trackBorders)) {
                         // No need to reset position, as bounce is handled in isWithinBorders
                     }
 
                     float targetAngle = std::atan2(direction.y, direction.x) * 180.f / PI;
-                    aiCar1.setRotation(targetAngle);
+                    aiCar.setRotation(targetAngle);
                 }
             }
 
-            // AI car 2 logic: move towards the next checkpoint
-            if (ai2CurrentCheckpoint < checkpointPositions.size()) {
-                sf::Vector2f target = checkpointPositions[ai2CurrentCheckpoint];
-                sf::Vector2f direction = target - aiCar2.getPosition();
-                float distanceToTarget = distance(aiCar2.getPosition(), target);
-
-                if (hasHitCheckpoint(aiCar2.getPosition(), target)) {
-                    ai2CurrentCheckpoint++;
-                    ai2CheckpointsHit++;
-                    if (ai2CurrentCheckpoint >= checkpointPositions.size()) {
-                        ai2CurrentCheckpoint = 0; // Loop back to the first checkpoint
-                    }
-                } else {
-                    direction /= distanceToTarget;
-                    aiCar2.move(direction * ai2Speed);
-
-                    if (!isWithinBorders(aiCar2, ai2Speed, trackBorders)) {
-                        // No need to reset position, as bounce is handled in isWithinBorders
-                    }
-
-                    float targetAngle = std::atan2(direction.y, direction.x) * 180.f / PI;
-                    aiCar2.setRotation(targetAngle);
+            // Check if AI hits checkpoint
+            if (hasHitCheckpoint(aiCar.getPosition(), checkpointPositions[aiCurrentCheckpoint])) {
+                aiCurrentCheckpoint++;
+                aiCheckpointsHit++;
+                if (aiCurrentCheckpoint >= checkpointPositions.size()) {
+                    aiCurrentCheckpoint = 0; // Loop back to first checkpoint
                 }
             }
 
@@ -287,12 +270,9 @@ int main() {
             if (playerCheckpointsHit >= 4) {
                 raceOver = true;
                 winner = "Player 1";
-            } else if (ai1CheckpointsHit >= 4) {
+            } else if (aiCheckpointsHit >= 4) {
                 raceOver = true;
-                winner = "AI 1";
-            } else if (ai2CheckpointsHit >= 4) {
-                raceOver = true;
-                winner = "AI 2";
+                winner = "AI";
             }
         }
 
@@ -317,11 +297,8 @@ int main() {
         // Player car
         window.draw(playerCar);
 
-        // AI car 1 with blue filter
-        window.draw(aiCar1, &blueShader);
-
-        // AI car 2 without blue filter
-        window.draw(aiCar2);
+        // AI car with blue filter
+        window.draw(aiCar, &blueShader);
 
         // Display race results if finished
         if (raceOver) {
@@ -350,11 +327,7 @@ int main() {
             checkpointStatus.setPosition(10.f, 10.f);
 
             std::string status = "Player 1: " + std::to_string(playerCheckpointsHit) + "/4\n";
-            status += "AI 1: " + std::to_string(ai1CheckpointsHit) + "/4\n";
-            status += "AI 2: " + std::to_string(ai2CheckpointsHit) + "/4\n";
-            status += "Player 1 Remaining: " + std::to_string(4 - playerCheckpointsHit) + "\n";
-            status += "AI 1 Remaining: " + std::to_string(4 - ai1CheckpointsHit) + "\n";
-            status += "AI 2 Remaining: " + std::to_string(4 - ai2CheckpointsHit);
+            status += "AI: " + std::to_string(aiCheckpointsHit) + "/4\n";
 
             checkpointStatus.setString(status);
             window.draw(checkpointStatus);
