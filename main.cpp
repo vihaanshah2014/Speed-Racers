@@ -1,5 +1,5 @@
 /******************************************************
- *  2D Racing with Two-Player Mode + SFML
+ *  2D Racing with Two-Player Mode + Simple AI Optimization + SFML
  ******************************************************/
 
 #include <SFML/Graphics.hpp>
@@ -9,14 +9,23 @@
 #include <string>
 #include <algorithm>
 #include <chrono>
+#include <random>
+#include <iomanip>
 
 // -------------------- Constants --------------------
 static const float PI = 3.14159265f;
 static const float CHECKPOINT_RADIUS = 30.0f;
+static const size_t POPULATION_SIZE = 20;
+static const int GENERATIONS = 3; // Number of pre-races for optimization
+static const float MUTATION_RATE = 0.05f; // Mutation rate for waypoint adjustments
 
 // -------------------- Utility Functions --------------------
 float degToRad(float deg) {
     return deg * PI / 180.0f;
+}
+
+float radToDeg(float rad) {
+    return rad * 180.0f / PI;
 }
 
 float distance(const sf::Vector2f& a, const sf::Vector2f& b) {
@@ -25,6 +34,7 @@ float distance(const sf::Vector2f& a, const sf::Vector2f& b) {
     return std::sqrt(dx * dx + dy * dy);
 }
 
+// Checks if the car is within track borders and handles collision
 bool isWithinBorders(sf::Sprite& car, float& speed, const std::vector<sf::RectangleShape>& borders) {
     for (const auto& border : borders) {
         if (car.getGlobalBounds().intersects(border.getGlobalBounds())) {
@@ -42,8 +52,105 @@ bool isWithinBorders(sf::Sprite& car, float& speed, const std::vector<sf::Rectan
     return true;
 }
 
+// Checks if the car has hit a checkpoint
 bool hasHitCheckpoint(const sf::Vector2f& carPosition, const sf::Vector2f& checkpointPosition) {
     return distance(carPosition, checkpointPosition) < CHECKPOINT_RADIUS;
+}
+
+// -------------------- AI Optimization Structures --------------------
+struct AIIndividual {
+    std::vector<sf::Vector2f> waypoints;
+    float fitness; // Lower is better
+};
+
+// -------------------- Simulation Function --------------------
+// Simulates the AI car running through the waypoints and calculates fitness
+float simulateRun(const std::vector<sf::Vector2f>& waypoints, const std::vector<sf::RectangleShape>& borders, float aiSpeed) {
+    // Create a temporary AI car sprite for simulation
+    sf::Texture dummyTexture;
+    dummyTexture.create(40, 20); // Create a dummy texture
+    sf::Sprite tempAiCar(dummyTexture);
+    tempAiCar.setOrigin(dummyTexture.getSize().x / 2.0f, dummyTexture.getSize().y / 2.0f);
+    tempAiCar.setPosition(waypoints[0]);
+    tempAiCar.setRotation(0.f);
+
+    size_t currentWaypoint = 0;
+    float totalTime = 0.0f;
+    float speed = aiSpeed;
+    const float TIME_STEP = 1.0f / 60.0f; // Simulate at 60 FPS
+    int collisionCount = 0;
+
+    while (currentWaypoint < waypoints.size()) {
+        sf::Vector2f target = waypoints[currentWaypoint];
+        sf::Vector2f direction = target - tempAiCar.getPosition();
+        float distanceToTarget = distance(tempAiCar.getPosition(), target);
+
+        if (distanceToTarget < 10.0f) {
+            currentWaypoint++;
+            continue;
+        }
+
+        // Normalize direction
+        if (distanceToTarget != 0) {
+            direction /= distanceToTarget;
+        }
+
+        // Move AI car
+        tempAiCar.move(direction * speed);
+
+        // Set rotation towards movement direction
+        float targetAngle = radToDeg(std::atan2(direction.y, direction.x));
+        tempAiCar.setRotation(targetAngle);
+
+        // Check for collision
+        if (!isWithinBorders(tempAiCar, speed, borders)) {
+            collisionCount++;
+            totalTime += TIME_STEP * 2; // Penalize time for collision
+        }
+
+        totalTime += TIME_STEP;
+    }
+
+    // Fitness calculation: lower time and fewer collisions are better
+    float fitness = totalTime + (collisionCount * 5.0f); // Each collision adds a penalty
+    return fitness;
+}
+
+// -------------------- Optimization Function --------------------
+// Optimizes the AI waypoints by running pre-races and adjusting waypoints based on performance
+std::vector<sf::Vector2f> optimizeWaypoints(std::vector<sf::Vector2f> waypoints, const std::vector<sf::RectangleShape>& borders, float aiSpeed, int generations) {
+    std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<float> mutationDist(-20.0f, 20.0f); // Mutation range
+
+    float bestFitness = simulateRun(waypoints, borders, aiSpeed);
+    std::vector<sf::Vector2f> bestWaypoints = waypoints;
+
+    std::cout << "Starting AI Optimization...\n";
+
+    for (int gen = 1; gen <= generations; ++gen) {
+        // Create mutated waypoints
+        std::vector<sf::Vector2f> mutatedWaypoints = waypoints;
+        for (auto& wp : mutatedWaypoints) {
+            wp.x += mutationDist(rng);
+            wp.y += mutationDist(rng);
+        }
+
+        // Simulate the mutated waypoints
+        float fitness = simulateRun(mutatedWaypoints, borders, aiSpeed);
+        std::cout << "Pre-Race " << gen << " - Fitness: " << fitness << " (Best: " << bestFitness << ")\n";
+
+        // If mutated waypoints are better, keep them
+        if (fitness < bestFitness) {
+            bestFitness = fitness;
+            bestWaypoints = mutatedWaypoints;
+            std::cout << "Improved waypoints in Pre-Race " << gen << "!\n";
+        } else {
+            std::cout << "No improvement in Pre-Race " << gen << ".\n";
+        }
+    }
+
+    std::cout << "AI Optimization Complete! Best Fitness: " << bestFitness << "\n\n";
+    return bestWaypoints;
 }
 
 // -------------------- Main Function --------------------
@@ -187,20 +294,34 @@ int main() {
     float playerSpeed = 0.0f;
     float playerRotation = 0.0f;
 
-    // Main rendering loop
+    // -------------------- AI Optimization Phase --------------------
+    // Optimize AI waypoints using simple pre-races
+    aiWaypoints = optimizeWaypoints(aiWaypoints, trackBorders, aiSpeed, GENERATIONS);
+
+    // Reset AI car position after optimization
+    aiCar.setPosition(trainingWaypoints[0]);
+    aiCurrentWaypoint = 0;
+
+    // -------------------- Main Game Loop --------------------
     bool raceOver = false;
     std::string winner;
+
+    // Load font for in-game text
+    sf::Font font;
+    if (!font.loadFromFile("arial.ttf")) {
+        std::cerr << "Failed to load font!\n";
+        // You can set SHOW_DEBUG_TEXT to false to avoid displaying text
+    }
 
     while (window.isOpen()) {
         sf::Event event;
         while (window.pollEvent(event)) {
-            if (event.type == sf::Event::Closed) {
+            if (event.type == sf::Event::Closed)
                 window.close();
-            }
         }
 
         if (!raceOver) {
-            // Player 1 Controls (WASD)
+            // Player Controls (WASD)
             playerSpeed = 0.0f;
             playerRotation = 0.0f;
 
@@ -214,22 +335,24 @@ int main() {
                 playerRotation = 3.0f;
 
             // Update player car position
-            sf::Vector2f oldPlayerPos = playerCar.getPosition();
             playerCar.rotate(playerRotation);
             float angle = degToRad(playerCar.getRotation());
             playerCar.move(std::cos(angle) * playerSpeed, std::sin(angle) * playerSpeed);
 
             // Check for collision and adjust position if necessary
             if (!isWithinBorders(playerCar, playerSpeed, trackBorders)) {
-                // No need to reset position, as bounce is handled in isWithinBorders
+                // Collision handled in isWithinBorders
             }
 
             // Check if player hits checkpoint
-            if (hasHitCheckpoint(playerCar.getPosition(), checkpointPositions[playerCurrentCheckpoint])) {
-                playerCurrentCheckpoint++;
-                playerCheckpointsHit++;
-                if (playerCurrentCheckpoint >= checkpointPositions.size()) {
-                    playerCurrentCheckpoint = 0; // Loop back to first checkpoint
+            if (playerCurrentCheckpoint < checkpointPositions.size()) {
+                if (hasHitCheckpoint(playerCar.getPosition(), checkpointPositions[playerCurrentCheckpoint])) {
+                    playerCheckpointsHit++;
+                    playerCurrentCheckpoint++;
+                    std::cout << "Player hit checkpoint " << playerCheckpointsHit << "\n";
+                    if (playerCurrentCheckpoint >= checkpointPositions.size()) {
+                        playerCurrentCheckpoint = 0; // Loop back to first checkpoint
+                    }
                 }
             }
 
@@ -245,11 +368,11 @@ int main() {
                         aiCurrentWaypoint = 0; // Loop back to the first waypoint
                     }
                 } else {
-                    direction /= distanceToTarget;
+                    direction /= distanceToTarget; // Normalize direction
                     aiCar.move(direction * aiSpeed);
 
                     if (!isWithinBorders(aiCar, aiSpeed, trackBorders)) {
-                        // No need to reset position, as bounce is handled in isWithinBorders
+                        // Collision handled in isWithinBorders
                     }
 
                     float targetAngle = std::atan2(direction.y, direction.x) * 180.f / PI;
@@ -258,21 +381,26 @@ int main() {
             }
 
             // Check if AI hits checkpoint
-            if (hasHitCheckpoint(aiCar.getPosition(), checkpointPositions[aiCurrentCheckpoint])) {
-                aiCurrentCheckpoint++;
-                aiCheckpointsHit++;
-                if (aiCurrentCheckpoint >= checkpointPositions.size()) {
-                    aiCurrentCheckpoint = 0; // Loop back to first checkpoint
+            if (aiCurrentCheckpoint < checkpointPositions.size()) {
+                if (hasHitCheckpoint(aiCar.getPosition(), checkpointPositions[aiCurrentCheckpoint])) {
+                    aiCheckpointsHit++;
+                    aiCurrentCheckpoint++;
+                    std::cout << "AI hit checkpoint " << aiCheckpointsHit << "\n";
+                    if (aiCurrentCheckpoint >= checkpointPositions.size()) {
+                        aiCurrentCheckpoint = 0; // Loop back to first checkpoint
+                    }
                 }
             }
 
             // Check if the race is over
-            if (playerCheckpointsHit >= 4) {
+            if (playerCheckpointsHit >= checkpointPositions.size()) {
                 raceOver = true;
-                winner = "Player 1";
-            } else if (aiCheckpointsHit >= 4) {
+                winner = "Player";
+                std::cout << "Player Wins!\n";
+            } else if (aiCheckpointsHit >= checkpointPositions.size()) {
                 raceOver = true;
                 winner = "AI";
+                std::cout << "AI Wins!\n";
             }
         }
 
@@ -301,13 +429,7 @@ int main() {
         window.draw(aiCar, &blueShader);
 
         // Display race results if finished
-        if (raceOver) {
-            sf::Font font;
-            if (!font.loadFromFile("arial.ttf")) {
-                std::cerr << "Failed to load font!\n";
-                return -1;
-            }
-
+        if (raceOver && font.getInfo().family != "") {
             sf::Text resultText;
             resultText.setFont(font);
             resultText.setString(winner + " Wins!");
@@ -318,16 +440,15 @@ int main() {
         }
 
         // Display checkpoint status
-        sf::Font font;
-        if (font.loadFromFile("arial.ttf")) {
+        if (font.getInfo().family != "") {
             sf::Text checkpointStatus;
             checkpointStatus.setFont(font);
             checkpointStatus.setCharacterSize(24);
             checkpointStatus.setFillColor(sf::Color::White);
             checkpointStatus.setPosition(10.f, 10.f);
 
-            std::string status = "Player 1: " + std::to_string(playerCheckpointsHit) + "/4\n";
-            status += "AI: " + std::to_string(aiCheckpointsHit) + "/4\n";
+            std::string status = "Player: " + std::to_string(playerCheckpointsHit) + "/" + std::to_string(checkpointPositions.size()) + "\n";
+            status += "AI: " + std::to_string(aiCheckpointsHit) + "/" + std::to_string(checkpointPositions.size());
 
             checkpointStatus.setString(status);
             window.draw(checkpointStatus);

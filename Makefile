@@ -1,32 +1,16 @@
-# Makefile
+# Makefile for 2D Racing Game
 
-# Compiler
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -O2
+LIBS = -lsfml-graphics -lsfml-window -lsfml-system
 
-# SFML Libraries
-SFML_LIBS = -lsfml-graphics -lsfml-window -lsfml-system
-
-# Target
 TARGET = race
+SRC = main.cpp
 
-# Source Files
-SRCS = main.cpp
-
-# Object Files
-OBJS = $(SRCS:.cpp=.o)
-
-# Build Target
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJS) $(SFML_LIBS)
+$(TARGET): $(SRC)
+	$(CXX) $(CXXFLAGS) $(SRC) -o $(TARGET) $(LIBS)
 
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# Clean Up
 clean:
-	rm -f $(OBJS) $(TARGET)
-
-.PHONY: all clean
+	rm -f $(TARGET) *.o
