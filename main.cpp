@@ -12,6 +12,7 @@
 #include <random>
 #include <tuple>
 #include <limits>
+#include <chrono>
 
 // -------------------- Constants --------------------
 static const float PI                = 3.14159265f;
@@ -21,9 +22,9 @@ static const int   NUM_ACTIONS      = 5;    // STEER_LEFT, STEER_RIGHT, ACCELERA
 static const int   POPULATION_SIZE  = 100;  // Number of AI cars per generation
 static const int   TOP_PERFORMERS   = 20;   // Number of top cars to select
 static const float MUTATION_RATE    = 0.1f; // Mutation rate for policy weights
-static const int   MAX_STEPS        = 10000; // Max steps per evaluation
-static const int   MAX_GENERATIONS  = 1000000; // Stop after these many generations if no success
-const int MAX_STEPS_PER_EPISODE = 100000;  // Limit steps per episode
+static const int   MAX_STEPS        = 1000; // Max steps per evaluation
+static const int   MAX_GENERATIONS  = 10000; // Stop after these many generations if no success
+const int MAX_STEPS_PER_EPISODE = 1000;  // Limit steps per episode
 const float MIN_SPEED_THRESHOLD = 0.1f;  // Minimum speed threshold
 const int MAX_ZERO_SPEED_STEPS = 50;     // Maximum steps allowed at zero speed
 
@@ -424,83 +425,73 @@ int main() {
     // Training loop
     std::cout << "\nStarting training...\n" << std::endl;
     int generation = 0;
+    auto startTime = std::chrono::high_resolution_clock::now();
+    int lastProgress = 0;
+
     while (generation < MAX_GENERATIONS && !raceCompleted) {
         generation++;
         
-        // Only show every 10th generation
-        if (generation % 10 == 0) {
-            std::cout << "\n=== Generation " << generation << " ===" << std::endl;
+        // Calculate progress percentage
+        int progress = (generation * 100) / MAX_GENERATIONS;
+        if (progress != lastProgress) {
+            auto currentTime = std::chrono::high_resolution_clock::now();
+            auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+                currentTime - startTime).count();
+            
+            // Clear line and show progress
+            std::cout << "\rProgress: " << progress << "% | "
+                      << "Generation: " << generation << " | "
+                      << "Time: " << elapsedSeconds << "s | "
+                      << "Best Waypoints: " << bestEver.waypoints 
+                      << std::flush;
+            
+            lastProgress = progress;
         }
 
         std::vector<std::pair<float, bool>> performances;
         performances.reserve(POPULATION_SIZE);
 
-        float generationBestReward = -std::numeric_limits<float>::max();
-        int generationBestWaypoints = 0;
-
-        // Evaluate each car
+        // Evaluate each car (remove all logging from evaluate())
         for (int i = 0; i < POPULATION_SIZE; i++) {
             auto& car = population[i];
             auto [reward, success] = car.evaluate();
             performances.push_back({reward, success});
 
-            // Track best performance this generation
-            if (reward > generationBestReward) {
-                generationBestReward = reward;
-                generationBestWaypoints = car.targetWaypointIndex;
-            }
-
-            // Track all-time best
             if (reward > bestEver.reward) {
                 bestEver.reward = reward;
                 bestEver.generation = generation;
                 bestEver.waypoints = car.targetWaypointIndex;
                 bestEver.weights = car.policyWeights;
-                std::cout << "\n*** NEW BEST ***" 
-                          << "\nGeneration: " << generation 
-                          << "\nReward: " << reward 
-                          << "\nWaypoints: " << car.targetWaypointIndex << std::endl;
             }
 
             if (success) {
                 raceCompleted = true;
-                std::cout << "\n!!! TRACK COMPLETED !!!" << std::endl;
-                std::cout << "Generation: " << generation << std::endl;
-                std::cout << "Reward: " << reward << std::endl;
             }
         }
 
-        // Generation stats
-        float avgReward = 0.f;
-        int successCount = 0;
-        for (auto& perf : performances) {
-            avgReward += perf.first;
-            if (perf.second) successCount++;
-        }
-        avgReward /= performances.size();
-
-        std::cout << "Best This Gen: " << generationBestReward
-                  << " (" << generationBestWaypoints << " waypoints)"
-                  << "\nAll-time Best: " << bestEver.reward 
-                  << " (Gen " << bestEver.generation 
-                  << ", " << bestEver.waypoints << " waypoints)" << std::endl;
-
-        // Create next generation
+        // Create next generation (silently)
         std::vector<Car> topPerformers = selectTopPerformers(population, performances, TOP_PERFORMERS);
         population = createNextGeneration(topPerformers, POPULATION_SIZE, rng);
     }
 
-    // At the end of training:
-    std::cout << "\n=== Training Complete ===" << std::endl;
+    // Final report
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto totalSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+        endTime - startTime).count();
+
+    std::cout << "\n\n=== Training Complete ===" << std::endl;
+    std::cout << "Total Time: " << totalSeconds << " seconds" << std::endl;
     std::cout << "Generations Run: " << generation << std::endl;
-    std::cout << "Best Performance:" << std::endl;
+    std::cout << "\nBest Performance:" << std::endl;
     std::cout << "  Generation: " << bestEver.generation << std::endl;
     std::cout << "  Reward: " << bestEver.reward << std::endl;
-    std::cout << "  Waypoints: " << bestEver.waypoints << std::endl;
+    std::cout << "  Waypoints: " << bestEver.waypoints << "/" 
+              << trainingWaypoints.size() << std::endl;
+
     if (raceCompleted) {
-        std::cout << "SUCCESS: Track completed!" << std::endl;
+        std::cout << "\nSUCCESS: Track completed!" << std::endl;
     } else {
-        std::cout << "Track not completed. Best progress: " 
+        std::cout << "\nTrack not completed. Best progress: " 
                   << bestEver.waypoints << " waypoints" << std::endl;
     }
 
